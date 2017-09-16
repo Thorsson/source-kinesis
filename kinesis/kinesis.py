@@ -361,7 +361,8 @@ class KinesisStream(panoply.DataSource, Logger):
             return None
 
         # import/update available shards for this stream
-        self.process_stream_shards()
+        self.shards = self.process_stream_shards(self.shards, self.stream_name)
+        self.shard_count = len(self.shards)
 
         # divide evenly number of records for every shard import
         max_record_count = BATCH_MAX_SIZE / self.shard_count
@@ -431,23 +432,21 @@ class KinesisStream(panoply.DataSource, Logger):
         return description('Shards', [])
 
     @exception_decorator
-    def process_stream_shards(self):
+    def process_stream_shards(self, shards, stream_name):
         """
         It imports/updates information about the shards for the selected stream
         :return: updated object that contains a list of shard information
         """
-        shard_list = self.get_stream_shards(self.stream_name)
+        shard_list = self.get_stream_shards(stream_name)
 
         for shard in shard_list:
             shard_id = shard['ShardId']
 
-            if shard_id not in self.shards:
+            if shard_id not in shards:
                 sequence_number = shard['SequenceNumberRange']['StartingSequenceNumber']
-                self.shards[shard_id] = {
+                shards[shard_id] = {
                     'last_sequence_number': sequence_number,
                     'last_processed': None
                 }
 
-        self.shard_count = len(self.shards)
-
-        return self.shards
+        return shards
