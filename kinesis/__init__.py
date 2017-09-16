@@ -27,7 +27,6 @@ CONFIG = {
             "name": "region_name",
             "required": True,
             "title": "Region name",
-            "type": "password",
             "help": "AWS Region where you are running Kinesis"
         },
         {

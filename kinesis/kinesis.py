@@ -10,35 +10,53 @@ import botocore
 import threading
 from functools import wraps
 
+# default destination name
 DESTINATION = "kinesis_stream"
-# kinesis iterator types
-ITERATOR_TYPE = {
-    'at_sequence_number': 'AT_SEQUENCE_NUMBER',
-    'after_sequence_number': 'AFTER_SEQUENCE_NUMBER',
-    'trim': 'TRIM_HORIZON',
-    'latest': 'LATEST'
-}
+
+# Kinesis iterator types
+ITERATOR_TYPE_AT = 'AT_SEQUENCE_NUMBER'
+ITERATOR_TYPE_AFTER = 'AFTER_SEQUENCE_NUMBER'
+ITERATOR_TYPE_TRIM = 'TRIM_HORIZON'
+ITERATOR_TYPE_LATEST = 'LATEST'
+
 # total number of elements to import
 BATCH_MAX_SIZE = 5000
+
+# total number of records per import
+# this is needed because for example we could enter into
+# endless loop with single import and this importer
+# would behave like a sync streaming in case more data is coming
+# in than it was processed
+MAX_TOTAL_IMPORT_SIZE = 1_000_000
+
 # each shard iterator result list
 ITERATOR_MAX_RESULTS = 25
+
+# Switch for debugging output
 DEBUG = False
 
 # on throttling how many times to repeat
 MAX_RETRIES = 5
+
 # on throttling how much time should go into sleep
 SLEEP_INTERVAL = 5
 
 # exceptions
 RETRY_EXCEPTIONS = ('ProvisionedThroughputExceededException',
-                    'ThrottlingException')
+    'ThrottlingException')
 RESOURCE_EXCEPTIONS = ('ResourceNotFoundException',
-                       'NoSuchEntityException')
+    'NoSuchEntityException')
 CREDENTIALS_EXCEPTIONS = ('UnrecognizedClientException',
-                          'InvalidSignatureException')
+    'InvalidSignatureException')
 
 
 def exception_decorator(f):
+    """
+    Exception decorator to catch all the exceptions coming
+    from AWS client library. It is intercepting error response code
+    and detecting resource or credentials errors.
+    """
+
     @wraps(f)
     def wrapped(*args, **kwargs):
         try:
@@ -57,19 +75,33 @@ def exception_decorator(f):
             # missing attributes
             Logger.error(err)
 
-        if 'res' in locals():
-            return res
+        return res
 
     return wrapped
 
-
+"""
+Error invoked when shard that was already present in cached memory
+has expired, this can happen when there are changes to number of shards
+in the stream.
+"""
 class ClosedShardError(Exception):
     def __init__(self, shard_id, message):
+        super(ClosedShardError, self).__init__(message)
         self.shard_id = shard_id
         self.message = message
 
 
+"""
+Mixin class for logging events and invoking panoply exception,
+every class that needs to output exceptions outside internal classes
+will include this mixin
+"""
 class Logger():
+    """
+    method to log any message output if DEBUG it turned on it will
+    print to the console otherwise it will pass log message to actual
+    instance log
+    """
     @staticmethod
     def log(content, instance=None):
         if DEBUG:
@@ -77,18 +109,31 @@ class Logger():
         elif instance is not None:
             instance.log(content)
 
+    """
+    method to invoke panoply exception that will be propagated 
+    to the panoply core engine
+    """
     @staticmethod
     def error(content, retryable=False):
         Logger.log('Error: {}'.format(content))
         raise panoply.PanoplyException(content, retryable=False)
 
+    """
+    instance method to call log internally if it is a sublass of
+    panoply.DataSource it will call internal log
+    """
     def local_log(self, content):
         if self.instance:
             Logger.log(content, self.instance)
         else:
             Logger.log(content)
 
-
+"""
+KinesisWorker is a thread class that will be used to process specific shard.
+threads will perform in parallel and it will import up to maximum number of records
+that is permitted by shard, in case of throttling of the api it will put it into sleep
+for a predefined amount of time 
+"""
 class KinesisWorker(threading.Thread, Logger):
     def __init__(self, stream_name, shard_id,
                  shard_data={},
@@ -129,6 +174,11 @@ class KinesisWorker(threading.Thread, Logger):
         self.local_log('Shard {} Worker import is finished'.format(self.shard_id))
 
     def _get_shard_records(self):
+        """
+        it will import all the records available for this specific shard, on the setup phase
+        the first import per shard will start by importing the latest records and the following
+        ones will start importing from the last sequence number
+        """
         retry_count = MAX_RETRIES
         all_records = []
         options = {
@@ -136,16 +186,22 @@ class KinesisWorker(threading.Thread, Logger):
             'ShardId': self.shard_id,
         }
 
-        if not self.shard_data['last_processed']:
-            options['ShardIteratorType'] = ITERATOR_TYPE['latest']
-        else:
+        if self.shard_data['last_processed']:
+            # after the initial import it will start importing from the last sequence number
+            # that is available in descriptor for last record
             options['StartingSequenceNumber'] = self.shard_data['last_sequence_number']
-            options['ShardIteratorType'] = ITERATOR_TYPE['after_sequence_number']
+            options['ShardIteratorType'] = ITERATOR_TYPE_AFTER
+        else:
+            # this one is used on the setup process and it will be used only for the first time
+            options['ShardIteratorType'] = ITERATOR_TYPE_LATEST
 
+        # get the initial iterator pointer, all the
+        # subsequent will be received in the get all records
         iterator_response = self.client.get_shard_iterator(**options)
         self.shard_iterator = iterator_response['ShardIterator']
 
         while True:
+            # loop until it reaches up to date iterator
             try:
                 iteration_records, is_latest_iteration = self._get_iteration_records()
                 all_records += iteration_records
@@ -156,11 +212,10 @@ class KinesisWorker(threading.Thread, Logger):
                     break
 
             except ClientError as err:
+                # this error occurs when there is a api throttling
                 self.local_log(err.message)
 
-                code = err.response['Error']['Code']
-
-                if code in RETRY_EXCEPTIONS:
+                if err.response['Error']['Code'] in RETRY_EXCEPTIONS:
                     # GetRecords has max size of 10mb of requests
                     retry_count -= 1
                     if retry_count > 0:
@@ -168,6 +223,7 @@ class KinesisWorker(threading.Thread, Logger):
                             self.sleep_interval))
                         time.sleep(self.sleep_interval)
                     else:
+                        # if it has passed allowed number of retries stop the worker
                         break
                 else:
                     break
@@ -193,10 +249,12 @@ class KinesisWorker(threading.Thread, Logger):
             raise ClosedShardError(self.shard_id, 'Shard has been closed for {}'.format(self.shard_id))
 
         self.shard_iterator = response['NextShardIterator']
-        records = response['Records']
+        # check if this is latest iteration
         is_latest_iteration = response['MillisBehindLatest'] == 0
 
+        records = response['Records']
         if len(records) > 0:
+            # process all the records to extract actual data
             for record in records:
                 # add processed records to the list of data
                 data = json.loads(record['Data'].decode("utf-8"))
@@ -210,6 +268,8 @@ class KinesisWorker(threading.Thread, Logger):
         else:
             self.local_log('No available records in shard "{}"'.format(self.shard_id))
 
+            # data can stay in shard for up to 72 hours and some shards can be removed a couple of day
+            # afterwards so this is safe estimate of 7 days to make sure it will clean it up
             week_ago = datetime.datetime.now() - datetime.timedelta(days=7)
             last_processed = self.shard_data['last_processed']
             if last_processed and last_processed < week_ago:
@@ -219,27 +279,50 @@ class KinesisWorker(threading.Thread, Logger):
 
         return record_data, is_latest_iteration
 
-    def get_shard_data(self):
-        # return changed options on otherwise revert to original one
-        return self.shard_data
 
-
+"""
+KinesisStream will be importing data from the stream and also 
+will be responsible to static methods that are needed during the setup 
+phase
+"""
 class KinesisStream(panoply.DataSource, Logger):
     @staticmethod
     @exception_decorator
     def get_streams(aws_access_key_id, aws_secret_access_key, region_name):
+        """
+        It gets a list of streams for the presented account
+        :param aws_access_key_id:
+        :param aws_secret_access_key:
+        :param region_name:
+        :return: list of kinesis streams
+        """
         client = KinesisStream.kinesis_client(aws_access_key_id,
                                               aws_secret_access_key,
                                               region_name)
-        streams = client.list_streams(Limit=200)
+        all_streams = []
 
-        if 'StreamNames' in streams:
-            return streams['StreamNames']
-        else:
-            return []
+        response = client.list_streams(Limit=200)
+        all_streams = response.get('StreamNames', [])
+
+        while True:
+            # if there are more strems pull until you get all of them
+            if response['HasMoreStreams']:
+                response = client.list_streams(Limit=200, ExclusiveStartStreamName=all_streams[-1])
+                all_streams = response.get('StreamNames', [])
+            else:
+                break
+
+        return all_streams
 
     @staticmethod
     def kinesis_client(aws_access_key_id, aws_secret_access_key, region_name):
+        """
+        create kinesis client
+        :param aws_access_key_id:
+        :param aws_secret_access_key:
+        :param region_name:
+        :return: kinesis client
+        """
         return boto3.client(
             'kinesis',
             aws_access_key_id=aws_access_key_id,
@@ -250,35 +333,37 @@ class KinesisStream(panoply.DataSource, Logger):
     def __init__(self, source, options):
         super(KinesisStream, self).__init__(source, options)
 
-        if source.get('destination') is None:
-            source['Destination'] = DESTINATION
+        # define destination in the source
+        source.setdefault('destination', DESTINATION)
 
-        if source.get('shards') is None:
-            source['shards'] = {}
+        # define cached list of shards for every import session
+        # to have latest sequence number pointer
+        self.shards = source.setdefault('shards', {})
+        self.shard_count = len(self.shards)
 
         self.source = source
-        self.aws_access_key_id = self.source.get('aws_access_key_id')
-        self.aws_secret_access_key = self.source.get('aws_secret_access_key')
-        self.region_name = self.source.get('region_name')
         self.stream_name = self.source.get('stream_name')
+        self.client = KinesisStream.kinesis_client(source.get('aws_access_key_id'),
+                                                   source.get('aws_secret_access_key'),
+                                                   source.get('region_name'))
 
         self.options = options
-        self.shards = source.get('shards')
-        self.shard_count = len(self.shards)
         self.instance = self
-        self.client = KinesisStream.kinesis_client(self.aws_access_key_id,
-                                                   self.aws_secret_access_key,
-                                                   self.region_name)
 
-        self.processed_records = BATCH_MAX_SIZE
+        self.processed_records = MAX_TOTAL_IMPORT_SIZE
 
     @exception_decorator
     def read(self):
+        # this is defined to prevent endless operation of this
+        # data source in case you are receiving more records into the
+        # stream before closing down all the shards
         if self.processed_records <= 0:
             return None
 
+        # import/update available shards for this stream
         self.process_stream_shards()
 
+        # divide evenly number of records for every shard import
         max_record_count = BATCH_MAX_SIZE / self.shard_count
         total_records = []
         threads = []
@@ -288,6 +373,7 @@ class KinesisStream(panoply.DataSource, Logger):
             'instance': self
         }
 
+        # setup thread worker for every shard
         for shard_id, shard_data in self.shards.items():
             worker = KinesisWorker(self.stream_name, shard_id,
                                    options=options,
@@ -298,12 +384,12 @@ class KinesisStream(panoply.DataSource, Logger):
             self.local_log('Shard "{}" Worker has started with import'.format(shard_id))
             worker.start()
 
-        for thread in threads:
-            thread.join()
+        # wait to complete all the workers before continuing
+        [thread.join() for thread in threads]
 
+        # import records from every worker
         for thread in threads:
-            thread_records = thread.records
-            total_records += thread_records
+            total_records += thread.records
 
             # update shard information from response
             # if the shard cannot receive any content anymore mark
@@ -320,27 +406,47 @@ class KinesisStream(panoply.DataSource, Logger):
         # make sure to finish one lifecycle after reaching max level
         self.processed_records -= len(total_records)
 
+        # define when to stop specific batch import
         if len(total_records) > 0:
             return total_records
         else:
             return None
 
     @exception_decorator
+    def get_stream_shards(self, stream_name):
+        """
+        gets the information about the stream
+        :param stream_name:
+        :return: list of shards for the selected stream
+        """
+        stream = self.client.describe_stream(StreamName=stream_name)
+
+        # it needs to check whether the response is actually having this dictionary
+        # from experience sometimes AWS api return missing content in some edge cases
+        # that are actually not invoking errors
+        # for example removing this stream will for some time return results and then
+        # it will return error that this stream doesn't exist
+        description = stream.get('StreamDescription', {})
+
+        return description('Shards', [])
+
+    @exception_decorator
     def process_stream_shards(self):
-        stream = self.client.describe_stream(StreamName=self.stream_name)
+        """
+        It imports/updates information about the shards for the selected stream
+        :return: updated object that contains a list of shard information
+        """
+        shard_list = self.get_stream_shards(self.stream_name)
 
-        if 'StreamDescription' in stream:
-            description = stream['StreamDescription']
+        for shard in shard_list:
+            shard_id = shard['ShardId']
 
-            for shard in description['Shards']:
-                shard_id = shard['ShardId']
-
-                if shard_id not in self.shards:
-                    sequence_number = shard['SequenceNumberRange']['StartingSequenceNumber']
-                    self.shards[shard_id] = {
-                        'last_sequence_number': sequence_number,
-                        'last_processed': None
-                    }
+            if shard_id not in self.shards:
+                sequence_number = shard['SequenceNumberRange']['StartingSequenceNumber']
+                self.shards[shard_id] = {
+                    'last_sequence_number': sequence_number,
+                    'last_processed': None
+                }
 
         self.shard_count = len(self.shards)
 
