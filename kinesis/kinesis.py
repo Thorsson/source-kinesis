@@ -22,13 +22,6 @@ ITERATOR_TYPE_LATEST = 'LATEST'
 # total number of elements to import
 BATCH_MAX_SIZE = 5000
 
-# total number of records per import
-# this is needed because for example we could enter into
-# endless loop with single import and this importer
-# would behave like a sync streaming in case more data is coming
-# in than it was processed
-MAX_TOTAL_IMPORT_SIZE = 1_000_000
-
 # each shard iterator result list
 ITERATOR_MAX_RESULTS = 25
 
@@ -350,16 +343,9 @@ class KinesisStream(panoply.DataSource, Logger):
         self.options = options
         self.instance = self
 
-        self.processed_records = MAX_TOTAL_IMPORT_SIZE
 
     @exception_decorator
     def read(self):
-        # this is defined to prevent endless operation of this
-        # data source in case you are receiving more records into the
-        # stream before closing down all the shards
-        if self.processed_records <= 0:
-            return None
-
         # import/update available shards for this stream
         self.shards = self.process_stream_shards(self.shards, self.stream_name)
         self.shard_count = len(self.shards)
@@ -403,9 +389,6 @@ class KinesisStream(panoply.DataSource, Logger):
 
         # update the shards iterator information for the next session
         self.source['shards'] = self.shards
-
-        # make sure to finish one lifecycle after reaching max level
-        self.processed_records -= len(total_records)
 
         # define when to stop specific batch import
         if len(total_records) > 0:
