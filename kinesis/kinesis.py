@@ -149,13 +149,13 @@ class KinesisWorker(threading.Thread, Logger):
         self.total_records = 0
         self.max_record_count = options.get('max_record_count', 500)
         self.client = options.get('client', None)
-        self.options = options
+        self.instance = options.get('instance', None)
         self.shard_data = shard_data
         self.original_shard_data = shard_data.copy()
         self.records = []
         self.deprecated_shard = False
         self.shard_iterator = None
-        self.instance = options.get('instance', None)
+
 
     def run(self):
         try:
@@ -228,12 +228,9 @@ class KinesisWorker(threading.Thread, Logger):
         is_latest_iteration = False
 
         if self.max_record_count <= 0:
-            return record_data
+            return record_data, False
 
-        max_size_per_shard = self.max_record_count
-        record_limit = max_size_per_shard
-        if record_limit > ITERATOR_MAX_RESULTS:
-            record_limit = ITERATOR_MAX_RESULTS
+        record_limit = min(self.max_record_count, ITERATOR_MAX_RESULTS)
 
         response = self.client.get_records(ShardIterator=self.shard_iterator, Limit=record_limit)
 
@@ -340,7 +337,6 @@ class KinesisStream(panoply.DataSource, Logger):
                                                    source.get('aws_secret_access_key'),
                                                    source.get('region_name'))
 
-        self.options = options
         self.instance = self
 
 
@@ -362,6 +358,7 @@ class KinesisStream(panoply.DataSource, Logger):
 
         # setup thread worker for every shard
         for shard_id, shard_data in self.shards.items():
+
             worker = KinesisWorker(self.stream_name, shard_id,
                                    options=options,
                                    shard_data=shard_data)
@@ -385,7 +382,7 @@ class KinesisStream(panoply.DataSource, Logger):
                 self.shards.pop(thread.shard_id, None)
 
             # shard iterator options should be updated
-            self.shards[thread.shard_id] = thread.get_shard_data()
+            self.shards[thread.shard_id] = thread.shard_data
 
         # update the shards iterator information for the next session
         self.source['shards'] = self.shards
@@ -412,7 +409,7 @@ class KinesisStream(panoply.DataSource, Logger):
         # it will return error that this stream doesn't exist
         description = stream.get('StreamDescription', {})
 
-        return description('Shards', [])
+        return description.get('Shards', [])
 
     @exception_decorator
     def process_stream_shards(self, shards, stream_name):

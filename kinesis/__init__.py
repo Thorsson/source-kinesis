@@ -98,7 +98,7 @@ CONFIG = {
             'help': 'Select only one stream for data import'
         }
     ],
-    'categories': [ '???' ],
+    'categories': [ 'APIS' ],
     'keywords': [ 'aws', 'kinesis', 'stream' ],
     'createdAt': '2017-08-31'
 }
