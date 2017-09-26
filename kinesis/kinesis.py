@@ -7,7 +7,6 @@ import json
 import panoply
 from botocore.exceptions import ClientError
 import botocore
-import threading
 from functools import wraps
 
 # default destination name
@@ -122,27 +121,16 @@ class Logger():
             Logger.log(content)
 
 """
-KinesisWorker is a thread class that will be used to process specific shard.
-threads will perform in parallel and it will import up to maximum number of records
+KinesisWorker is a worker class that will be used to process specific shard.
+Workers will perform in parallel and it will import up to maximum number of records
 that is permitted by shard, in case of throttling of the api it will put it into sleep
 for a predefined amount of time 
 """
-class KinesisWorker(threading.Thread, Logger):
+class KinesisWorker(Logger):
     def __init__(self, stream_name, shard_id,
                  shard_data={},
                  options={},
-                 sleep_interval=SLEEP_INTERVAL,
-                 name=None,
-                 group=None,
-                 args=(),
-                 kwargs={}):
-        if name is None:
-            name = shard_id
-
-        super(KinesisWorker, self).__init__(name=name,
-                                            group=group,
-                                            args=args,
-                                            kwargs=kwargs)
+                 sleep_interval=SLEEP_INTERVAL):
         self.stream_name = stream_name
         self.shard_id = str(shard_id)
         self.sleep_interval = sleep_interval
@@ -157,7 +145,7 @@ class KinesisWorker(threading.Thread, Logger):
         self.shard_iterator = None
 
 
-    def run(self):
+    def import_data(self):
         try:
             self.records = self._get_shard_records()
         except ClosedShardError as err:
@@ -349,40 +337,31 @@ class KinesisStream(panoply.DataSource, Logger):
         # divide evenly number of records for every shard import
         max_record_count = BATCH_MAX_SIZE / self.shard_count
         total_records = []
-        threads = []
         options = {
             'max_record_count': max_record_count,
             'client': self.client,
             'instance': self
         }
 
-        # setup thread worker for every shard
+        # setup shard workers for every shard
         for shard_id, shard_data in self.shards.items():
-
             worker = KinesisWorker(self.stream_name, shard_id,
                                    options=options,
                                    shard_data=shard_data)
-            worker.daemon = True
-            threads.append(worker)
 
             self.local_log('Shard "{}" Worker has started with import'.format(shard_id))
-            worker.start()
+            worker.import_data()
 
-        # wait to complete all the workers before continuing
-        [thread.join() for thread in threads]
-
-        # import records from every worker
-        for thread in threads:
-            total_records += thread.records
+            total_records += worker.records
 
             # update shard information from response
             # if the shard cannot receive any content anymore mark
             # for removal
-            if thread.deprecated_shard:
-                self.shards.pop(thread.shard_id, None)
+            if worker.deprecated_shard:
+                self.shards.pop(worker.shard_id, None)
 
             # shard iterator options should be updated
-            self.shards[thread.shard_id] = thread.shard_data
+            self.shards[worker.shard_id] = worker.shard_data
 
         # update the shards iterator information for the next session
         self.source['shards'] = self.shards
